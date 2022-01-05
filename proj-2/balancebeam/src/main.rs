@@ -3,10 +3,9 @@ mod response;
 
 use clap::Parser;
 use rand::{Rng, SeedableRng};
-use std::io;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 #[derive(Debug, Clone)]
 struct UpstreamState {
@@ -101,8 +100,7 @@ async fn main() {
     log::info!("Listening for requests on {}", options.bind);
 
     // Handle incoming connections
-    // Improv: Use tokio::sync::RwLock for better perf under contention
-    let state = Arc::new(Mutex::new(ProxyState {
+    let state = Arc::new(RwLock::new(ProxyState {
         upstream_addresses: options.upstream,
         active_health_check_interval: options.active_health_check_interval,
         active_health_check_path: options.active_health_check_path,
@@ -123,54 +121,50 @@ async fn main() {
 
         let state = Arc::clone(&state);
         tokio::spawn(async move {
-            let mut state = state.lock().await;
-            handle_connection(stream, &mut state).await;
+            handle_connection(stream, &state).await;
         })
         .await
         .unwrap();
     }
 }
 
-async fn connect_to_upstream(state: &mut ProxyState) -> Result<TcpStream, std::io::Error> {
+async fn connect_to_upstream(state: &Arc<RwLock<ProxyState>>) -> Result<TcpStream, std::io::Error> {
     let mut rng = rand::rngs::StdRng::from_entropy();
 
     loop {
-        if state
-            .upstream_addresses
-            .iter()
-            .filter(|x| !x.is_dead)
-            .count()
-            == 0
         {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "No more upstreams to connect",
-            ));
+            let state = state.read().await;
+            if state
+                .upstream_addresses
+                .iter()
+                .filter(|x| !x.is_dead)
+                .count()
+                == 0
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "No more upstreams to connect",
+                ));
+            }
         }
 
-        let (is_dead, upstream_idx) = {
-            let (upstream, upstream_idx) = loop {
-                let upstream_idx = rng.gen_range(0, state.upstream_addresses.len());
-                let upstream = &state.upstream_addresses[upstream_idx];
-                if !upstream.is_dead {
-                    break (upstream, upstream_idx);
-                }
-            };
-            let upstream_ip = &upstream.addr;
-            match TcpStream::connect(upstream_ip).await {
-                Ok(stream) => {
-                    return Ok(stream);
-                }
-                Err(err) => {
-                    log::error!("Failed to connect to upstream {}: {}", upstream_ip, err);
-                    (true, upstream_idx)
-                }
+        let (upstream_ip, upstream_idx) = loop {
+            let state = state.read().await;
+            let upstream_idx = rng.gen_range(0, state.upstream_addresses.len());
+            let upstream = &state.upstream_addresses[upstream_idx];
+            if !upstream.is_dead {
+                break (upstream.addr.clone(), upstream_idx);
             }
         };
-
-        if is_dead {
-            state.upstream_addresses[upstream_idx].is_dead = true;
-            continue;
+        match TcpStream::connect(&upstream_ip).await {
+            Ok(stream) => {
+                return Ok(stream);
+            }
+            Err(err) => {
+                log::error!("Failed to connect to upstream {}: {}", &upstream_ip, err);
+                let mut state = state.write().await;
+                state.upstream_addresses[upstream_idx].is_dead = true;
+            }
         }
     }
 }
@@ -188,7 +182,7 @@ async fn send_response(client_conn: &mut TcpStream, response: &http::Response<Ve
     }
 }
 
-async fn handle_connection(mut client_conn: TcpStream, state: &mut ProxyState) {
+async fn handle_connection(mut client_conn: TcpStream, state: &Arc<RwLock<ProxyState>>) {
     let client_ip = client_conn.peer_addr().unwrap().ip().to_string();
     log::info!("Connection received from {}", client_ip);
 
