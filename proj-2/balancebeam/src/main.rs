@@ -6,6 +6,7 @@ use rand::{Rng, SeedableRng};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
+use tokio::time::{delay_for, Duration};
 
 #[derive(Debug, Clone)]
 struct UpstreamState {
@@ -69,7 +70,7 @@ struct ProxyState {
     #[allow(dead_code)]
     max_requests_per_minute: usize,
     /// Addresses of servers that we are proxying to
-    upstream_addresses: Vec<UpstreamState>,
+    upstream_addresses: RwLock<Vec<UpstreamState>>,
 }
 
 #[tokio::main]
@@ -100,12 +101,17 @@ async fn main() {
     log::info!("Listening for requests on {}", options.bind);
 
     // Handle incoming connections
-    let state = Arc::new(RwLock::new(ProxyState {
-        upstream_addresses: options.upstream,
+    let state = Arc::new(ProxyState {
+        upstream_addresses: RwLock::new(options.upstream),
         active_health_check_interval: options.active_health_check_interval,
         active_health_check_path: options.active_health_check_path,
         max_requests_per_minute: options.max_requests_per_minute,
-    }));
+    });
+
+    let shared_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        active_health_check(&shared_state).await;
+    });
 
     loop {
         let stream = match listener.accept().await {
@@ -119,28 +125,20 @@ async fn main() {
             }
         };
 
-        let state = Arc::clone(&state);
+        let shared_state = Arc::clone(&state);
         tokio::spawn(async move {
-            handle_connection(stream, &state).await;
-        })
-        .await
-        .unwrap();
+            handle_connection(stream, &shared_state).await;
+        });
     }
 }
 
-async fn connect_to_upstream(state: &Arc<RwLock<ProxyState>>) -> Result<TcpStream, std::io::Error> {
+async fn connect_to_upstream(state: &Arc<ProxyState>) -> Result<TcpStream, std::io::Error> {
     let mut rng = rand::rngs::StdRng::from_entropy();
 
     loop {
         {
-            let state = state.read().await;
-            if state
-                .upstream_addresses
-                .iter()
-                .filter(|x| !x.is_dead)
-                .count()
-                == 0
-            {
+            let r_upstream_addresses = state.upstream_addresses.read().await;
+            if r_upstream_addresses.iter().filter(|x| !x.is_dead).count() == 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     "No more upstreams to connect",
@@ -149,9 +147,9 @@ async fn connect_to_upstream(state: &Arc<RwLock<ProxyState>>) -> Result<TcpStrea
         }
 
         let (upstream_ip, upstream_idx) = loop {
-            let state = state.read().await;
-            let upstream_idx = rng.gen_range(0, state.upstream_addresses.len());
-            let upstream = &state.upstream_addresses[upstream_idx];
+            let r_upstream_addresses = state.upstream_addresses.read().await;
+            let upstream_idx = rng.gen_range(0, r_upstream_addresses.len());
+            let upstream = &r_upstream_addresses[upstream_idx];
             if !upstream.is_dead {
                 break (upstream.addr.clone(), upstream_idx);
             }
@@ -162,8 +160,8 @@ async fn connect_to_upstream(state: &Arc<RwLock<ProxyState>>) -> Result<TcpStrea
             }
             Err(err) => {
                 log::error!("Failed to connect to upstream {}: {}", &upstream_ip, err);
-                let mut state = state.write().await;
-                state.upstream_addresses[upstream_idx].is_dead = true;
+                let mut w_upstream_addresses = state.upstream_addresses.write().await;
+                w_upstream_addresses[upstream_idx].is_dead = true;
             }
         }
     }
@@ -182,7 +180,7 @@ async fn send_response(client_conn: &mut TcpStream, response: &http::Response<Ve
     }
 }
 
-async fn handle_connection(mut client_conn: TcpStream, state: &Arc<RwLock<ProxyState>>) {
+async fn handle_connection(mut client_conn: TcpStream, state: &Arc<ProxyState>) {
     let client_ip = client_conn.peer_addr().unwrap().ip().to_string();
     log::info!("Connection received from {}", client_ip);
 
@@ -266,5 +264,39 @@ async fn handle_connection(mut client_conn: TcpStream, state: &Arc<RwLock<ProxyS
         // Forward the response to the client
         send_response(&mut client_conn, &response).await;
         log::debug!("Forwarded response to client");
+    }
+}
+
+async fn active_health_check(state: &Arc<ProxyState>) {
+    loop {
+        delay_for(Duration::from_secs(
+            state.active_health_check_interval as u64,
+        ))
+        .await;
+        let mut w_upstream_addresses = state.upstream_addresses.write().await;
+        for idx in 0..w_upstream_addresses.len() {
+            let upstream_ip = w_upstream_addresses[idx].addr.clone();
+            let request = http::Request::builder()
+                .method(http::Method::GET)
+                .uri(&state.active_health_check_path)
+                .header("Host", &upstream_ip)
+                .body(Vec::<u8>::new())
+                .unwrap();
+            let mut upstream = {
+                let upstream = TcpStream::connect(&upstream_ip).await;
+                if upstream.is_ok() {
+                    upstream.unwrap()
+                } else {
+                    continue;
+                }
+            };
+            let _ = request::write_to_stream(&request, &mut upstream).await;
+            let response = response::read_from_stream(&mut upstream, &request.method()).await;
+            if response.is_ok() && response.unwrap().status() == http::StatusCode::OK {
+                w_upstream_addresses[idx].is_dead = false;
+            } else {
+                w_upstream_addresses[idx].is_dead = true;
+            }
+        }
     }
 }
