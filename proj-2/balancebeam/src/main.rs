@@ -3,6 +3,7 @@ mod response;
 
 use clap::Parser;
 use rand::{Rng, SeedableRng};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
@@ -71,6 +72,9 @@ struct ProxyState {
     max_requests_per_minute: usize,
     /// Addresses of servers that we are proxying to
     upstream_addresses: RwLock<Vec<UpstreamState>>,
+    /// Client addresses for rate limiting
+    #[allow(dead_code)]
+    client_addresses: RwLock<HashMap<String, usize>>,
 }
 
 #[tokio::main]
@@ -103,6 +107,7 @@ async fn main() {
     // Handle incoming connections
     let state = Arc::new(ProxyState {
         upstream_addresses: RwLock::new(options.upstream),
+        client_addresses: RwLock::new(HashMap::new()),
         active_health_check_interval: options.active_health_check_interval,
         active_health_check_path: options.active_health_check_path,
         max_requests_per_minute: options.max_requests_per_minute,
@@ -112,6 +117,13 @@ async fn main() {
     tokio::spawn(async move {
         active_health_check(&shared_state).await;
     });
+
+    if state.max_requests_per_minute > 0 {
+        let shared_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            clear_rate_limit(&shared_state).await;
+        });
+    }
 
     loop {
         let stream = match listener.accept().await {
@@ -232,6 +244,13 @@ async fn handle_connection(mut client_conn: TcpStream, state: &Arc<ProxyState>) 
             request::format_request_line(&request)
         );
 
+        if state.max_requests_per_minute > 0 && rate_limit_client(&client_ip, state).await.is_err()
+        {
+            let response = response::make_http_error(http::StatusCode::TOO_MANY_REQUESTS);
+            send_response(&mut client_conn, &response).await;
+            return;
+        }
+
         // Add X-Forwarded-For header so that the upstream server knows the client's IP address.
         // (We're the ones connecting directly to the upstream server, so without this header, the
         // upstream server will only know our IP, not the client's.)
@@ -299,4 +318,20 @@ async fn active_health_check(state: &Arc<ProxyState>) {
             }
         }
     }
+}
+
+async fn rate_limit_client(client_ip: &String, state: &Arc<ProxyState>) -> Result<(), ()> {
+    let mut w_client_addresses = state.client_addresses.write().await;
+    let rpm = w_client_addresses.entry(client_ip.to_string()).or_insert(0);
+    *rpm += 1;
+    if *rpm > state.max_requests_per_minute {
+        return Err(());
+    }
+    Ok(())
+}
+
+async fn clear_rate_limit(state: &Arc<ProxyState>) {
+    delay_for(Duration::from_secs(60)).await;
+    let mut w_client_addresses = state.client_addresses.write().await;
+    w_client_addresses.clear();
 }
