@@ -205,7 +205,7 @@ async fn handle_connection(mut client_conn: TcpStream, state: &Arc<ProxyState>) 
             return;
         }
     };
-    let upstream_ip = client_conn.peer_addr().unwrap().ip().to_string();
+    let upstream_ip = upstream_conn.peer_addr().unwrap().ip().to_string();
 
     // The client may now send us one or more requests. Keep trying to read requests until the
     // client hangs up or we get an error.
