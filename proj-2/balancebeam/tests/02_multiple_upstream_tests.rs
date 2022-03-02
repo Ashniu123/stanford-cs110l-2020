@@ -1,9 +1,8 @@
 mod common;
 
-use common::{init_logging, BalanceBeam, EchoServer, ErrorServer, Server};
+use common::{init_logging, skip_time, BalanceBeam, EchoServer, ErrorServer, Server};
 
-use std::time::Duration;
-use tokio::time::delay_for;
+use tokio::time::{delay_for, Duration};
 
 async fn setup_with_params(
     n_upstreams: usize,
@@ -242,10 +241,11 @@ async fn test_active_health_checks_restore_failed_upstream() {
 
 /// Enable rate limiting and ensure that requests fail after sending more than the threshold
 #[tokio::test]
-async fn test_rate_limiting() {
+async fn test_simple_rate_limiting() {
     let n_upstreams = 1;
     let rate_limit_threshold = 5;
     let num_extra_requests: usize = 3;
+
     let (balancebeam, mut upstreams) =
         setup_with_params(n_upstreams, None, Some(rate_limit_threshold)).await;
 
@@ -264,6 +264,65 @@ async fn test_rate_limiting() {
         assert!(response_text.contains("x-forwarded-for: 127.0.0.1"));
     }
 
+    log::info!(
+        "Sending more requests that exceed the rate limit threshold. The server should \
+        respond to these with an HTTP 429 (too many requests) error."
+    );
+    for i in 0..num_extra_requests {
+        let client = reqwest::Client::new();
+        let response = client
+            .get(&format!("http://{}/overboard-{}", balancebeam.address, i))
+            .header("x-sent-by", "balancebeam-tests")
+            .send()
+            .await
+            .expect(
+                "Error sending rate limited request to balancebeam. You should be \
+                accepting the connection but sending back an HTTP error, rather than rejecting \
+                the connection outright.",
+            );
+        log::info!("{:?}", response);
+        log::info!("Checking to make sure the server responded with HTTP 429");
+        assert_eq!(response.status().as_u16(), 429);
+    }
+
+    log::info!("Ensuring the extra requests didn't go through to the upstream servers");
+    let mut total_request_count = 0;
+    while let Some(upstream) = upstreams.pop() {
+        total_request_count += upstream.stop().await;
+    }
+    assert_eq!(total_request_count, rate_limit_threshold);
+
+    log::info!("All done :)");
+}
+
+/// Enable rate limiting and ensure that requests fail after sending more than the threshold
+#[tokio::test]
+async fn test_advance_rate_limiting() {
+    let n_upstreams = 1;
+    let rate_limit_threshold = 5;
+    let num_extra_requests: usize = 3;
+
+    let (balancebeam, mut upstreams) =
+        setup_with_params(n_upstreams, None, Some(rate_limit_threshold)).await;
+
+    skip_time(Duration::from_secs(50)).await;
+
+    log::info!(
+        "Sending some basic requests to the server, within the rate limit threshold. These \
+        should succeed."
+    );
+    for i in 0..rate_limit_threshold {
+        let path = format!("/request-{}", i);
+        let response_text = balancebeam
+            .get(&path)
+            .await
+            .expect("Error sending request to balancebeam");
+        assert!(response_text.contains(&format!("GET {} HTTP/1.1", path)));
+        assert!(response_text.contains("x-sent-by: balancebeam-tests"));
+        assert!(response_text.contains("x-forwarded-for: 127.0.0.1"));
+    }
+
+    skip_time(Duration::from_secs(20)).await;
     log::info!(
         "Sending more requests that exceed the rate limit threshold. The server should \
         respond to these with an HTTP 429 (too many requests) error."

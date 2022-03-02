@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
-use tokio::time::{delay_for, Duration};
+use tokio::time::{delay_for, Duration, Instant};
 
 #[derive(Debug, Clone)]
 struct UpstreamState {
@@ -20,6 +20,12 @@ fn parse_upstream_state(s: &str) -> UpstreamState {
         addr: s.to_string(),
         is_dead: false,
     }
+}
+
+#[derive(Debug, Clone)]
+struct UpstreamRpm {
+    count: usize,
+    instant: Instant,
 }
 
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
@@ -74,7 +80,7 @@ struct ProxyState {
     upstream_addresses: RwLock<Vec<UpstreamState>>,
     /// Client addresses for rate limiting
     #[allow(dead_code)]
-    client_addresses: RwLock<HashMap<String, usize>>,
+    client_addresses: RwLock<HashMap<String, UpstreamRpm>>,
 }
 
 #[tokio::main]
@@ -321,17 +327,26 @@ async fn active_health_check(state: &Arc<ProxyState>) {
 }
 
 async fn rate_limit_client(client_ip: &String, state: &Arc<ProxyState>) -> Result<(), ()> {
+    let now = Instant::now();
+    let one_minute = Duration::from_secs(60);
     let mut w_client_addresses = state.client_addresses.write().await;
-    let rpm = w_client_addresses.entry(client_ip.to_string()).or_insert(0);
-    *rpm += 1;
-    if *rpm > state.max_requests_per_minute {
+    let rpm = w_client_addresses
+        .entry(client_ip.to_string())
+        .or_insert(UpstreamRpm {
+            count: 0,
+            instant: now,
+        });
+    rpm.count += 1;
+    if rpm.count > state.max_requests_per_minute
+        && Instant::now().duration_since(rpm.instant) < one_minute
+    {
         return Err(());
+    } else if Instant::now().duration_since(rpm.instant) >= one_minute {
+        rpm.instant = now;
+        rpm.count = 1;
     }
     Ok(())
 }
 
-async fn clear_rate_limit(state: &Arc<ProxyState>) {
-    delay_for(Duration::from_secs(60)).await;
-    let mut w_client_addresses = state.client_addresses.write().await;
-    w_client_addresses.clear();
-}
+/// TODO: Avoid overutilisation of the client_addresses hashmap
+async fn clear_rate_limit(_state: &Arc<ProxyState>) {}

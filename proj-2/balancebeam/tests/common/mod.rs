@@ -4,6 +4,7 @@ mod error_server;
 mod server;
 
 use std::sync;
+use tokio::time::{advance, pause, resume, Duration};
 
 pub use balancebeam::BalanceBeam;
 pub use echo_server::EchoServer;
@@ -19,4 +20,10 @@ pub fn init_logging() {
             .parse_filters("info")
             .init();
     });
+}
+
+pub async fn skip_time(duration: Duration) {
+    pause();
+    advance(duration).await;
+    resume();
 }
